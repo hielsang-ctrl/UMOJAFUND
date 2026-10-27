@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+media/
+staticfiles/
+*.pem
+*.cer
+db.sqlite3
+.venv/
