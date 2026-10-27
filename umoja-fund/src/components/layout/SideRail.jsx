@@ -2,8 +2,10 @@ import { NavLink } from "react-router-dom";
 import { HelpCircle, LogOut } from "lucide-react";
 import Pill from "../ui/Pill.jsx";
 import { NAV_ITEMS } from "../../config/navConfig.js";
+import { useAuth } from "../../context/AuthContext.jsx";
 
 export default function SideRail() {
+  const { logout } = useAuth();
   return (
     <aside className="hidden md:flex md:flex-col">
       <Pill className="sticky top-[73px] m-3 flex flex-col items-center gap-2 px-2 py-3">
@@ -17,7 +19,7 @@ export default function SideRail() {
         ))}
         <div className="my-1 h-px w-6 bg-stone-200" />
         <HelpCircle size={18} className="my-2 text-stone-400" />
-        <LogOut size={18} className="my-2 text-stone-400" />
+        <button onClick={logout} title="Sign out" aria-label="Sign out" className="my-1 flex h-10 w-10 items-center justify-center rounded-full text-stone-400 hover:bg-stone-100"><LogOut size={18} /></button>
       </Pill>
     </aside>
   );

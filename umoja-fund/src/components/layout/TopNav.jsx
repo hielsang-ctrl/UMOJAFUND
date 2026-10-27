@@ -1,12 +1,12 @@
 import { NavLink } from "react-router-dom";
-import { ChevronDown } from "lucide-react";
+import { LogOut } from "lucide-react";
 import Pill from "../ui/Pill.jsx";
 import Avatar from "../ui/Avatar.jsx";
 import { NAV_ITEMS } from "../../config/navConfig.js";
-import { useFund } from "../../context/FundContext.jsx";
+import { useAuth } from "../../context/AuthContext.jsx";
 
 export default function TopNav() {
-  const { role, setRole } = useFund();
+  const { user, logout } = useAuth();
   return (
     <div className="flex justify-center">
     <Pill className="inline-flex items-center gap-1 px-2 py-1.5">
@@ -34,13 +34,16 @@ export default function TopNav() {
 
       {/* Actions */}
       <div className="flex items-center gap-2">
-        <div className="flex items-center gap-2 rounded-full py-1 pl-1 pr-2">
-          <Avatar name="Admin User" size="h-8 w-8" />
-          <select value={role} onChange={(e) => setRole(e.target.value)} className="bg-transparent text-sm outline-none" aria-label="Viewing as">
-            <option value="admin">Admin</option>
-            <option value="member">Member</option>
-          </select>
-          <ChevronDown size={14} className="text-stone-400" />
+        <div className="flex items-center gap-2 rounded-full py-1 pl-1 pr-1">
+          <Avatar name={user.name} size="h-8 w-8" />
+          <div className="hidden text-left leading-tight sm:block">
+            <p className="text-sm font-medium">{user.name.split(" ")[0]}</p>
+            <p className="text-[11px] text-stone-400">{user.access === "admin" ? "Admin" : user.role}</p>
+          </div>
+          <button onClick={logout} title="Sign out" aria-label="Sign out"
+            className="flex h-8 w-8 items-center justify-center rounded-full bg-stone-100 text-stone-600 hover:bg-stone-200">
+            <LogOut size={14} />
+          </button>
         </div>
       </div>
     </Pill>
