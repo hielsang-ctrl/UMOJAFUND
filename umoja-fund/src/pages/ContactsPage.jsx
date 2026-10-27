@@ -28,6 +28,7 @@ export default function ContactsPage() {
   const [to, setTo] = useState(isAdmin ? "pending" : "admin"); // "pending" | "all" | "admin" | "m:<id>"
   const [message, setMessage] = useState("");
   const [notice, setNotice] = useState("");
+  const [noticeError, setNoticeError] = useState(false);
   const [copied, setCopied] = useState("");
   const [rsvp, setRsvp] = useState("");
 
@@ -50,12 +51,18 @@ export default function ContactsPage() {
   ];
   const selectedMember = to.startsWith("m:") ? members.find((m) => `m:${m.id}` === to) : null;
 
-  const send = () => {
+  const send = async () => {
     if (!message.trim()) return;
-    // real app: POST /messages { to, body } and let the server send SMS / email / WhatsApp
-    sendMessage({ to: recipientLabel, body: message.trim() });
-    setNotice(`Message sent to ${recipientLabel}.`);
-    setMessage("");
+    const isMember = to.startsWith("m:");
+    try {
+      await sendMessage({ audience: isMember ? "member" : to, recipient: isMember ? Number(to.slice(2)) : undefined, body: message.trim() });
+      setNoticeError(false);
+      setNotice(`Message sent to ${recipientLabel}.`);
+      setMessage("");
+    } catch (err) {
+      setNoticeError(true);
+      setNotice(err.message);
+    }
     setTimeout(() => setNotice(""), 4000);
   };
 
@@ -148,7 +155,7 @@ export default function ContactsPage() {
               <span className="text-xs text-stone-400">{message.length}/320 · To: {recipientLabel}</span>
               <Button onClick={send} disabled={!message.trim()} className="disabled:cursor-not-allowed disabled:bg-stone-200 disabled:text-stone-400"><Send size={14} /> Send</Button>
             </div>
-            {notice && <p className="mt-3 rounded-xl bg-emerald-50 px-3 py-2 text-xs text-emerald-700">{notice}</p>}
+            {notice && <p className={`mt-3 rounded-xl px-3 py-2 text-xs ${noticeError ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"}`}>{notice}</p>}
 
             {messages.length > 0 && (
               <div className="mt-4 border-t border-stone-100 pt-3">

@@ -93,6 +93,7 @@ export default function IdeasProofPage() {
   const [query, setQuery] = useState("");
   const [sort, setSort] = usePersistedState("ideas.sort", "latest");
   const [photoError, setPhotoError] = useState("");
+  const [posting, setPosting] = useState(false);
   const [lightbox, setLightbox] = useState("");
   const composerRef = useRef(null);
   const textRef = useRef(null);
@@ -124,12 +125,21 @@ export default function IdeasProofPage() {
     setTimeout(() => textRef.current?.focus(), 300);
   };
 
-  const submit = () => {
-    if (!text.trim()) return;
-    const id = addPost({ author, text: text.trim(), image, kind, date: today() });
-    // only the admin attaches proof to expenses (spending is admin-approved)
-    if (isAdmin && kind === "proof" && expenseId) linkProof(Number(expenseId), id);
-    setText(""); setImage(""); setExpenseId(""); setPhotoError("");
+  const submit = async () => {
+    if (!text.trim() || posting) return;
+    setPosting(true);
+    setPhotoError("");
+    try {
+      const file = image ? await (await fetch(image)).blob() : null; // the resized preview becomes the upload
+      const id = await addPost({ kind, text: text.trim(), file });
+      // only the admin attaches proof to expenses (the server enforces this too)
+      if (isAdmin && kind === "proof" && expenseId) await linkProof(Number(expenseId), id);
+      setText(""); setImage(""); setExpenseId("");
+    } catch (err) {
+      setPhotoError(err.message);
+    } finally {
+      setPosting(false);
+    }
   };
 
   return (
@@ -179,7 +189,7 @@ export default function IdeasProofPage() {
           {/* real app: upload to storage (S3/Cloudinary) and keep the returned URL */}
           <div className="mt-4 flex items-center justify-between gap-3">
             {image ? <button onClick={() => setImage("")} className="text-xs text-stone-500 underline">Remove photo</button> : photoError ? <span className="text-xs text-rose-600">{photoError}</span> : <span className="text-xs text-stone-400">Photos make proof far more convincing.</span>}
-            <Button onClick={submit} disabled={!text.trim()} className="disabled:cursor-not-allowed disabled:bg-stone-200 disabled:text-stone-400"><Send size={14} /> Post</Button>
+            <Button onClick={submit} disabled={!text.trim() || posting} className="disabled:cursor-not-allowed disabled:bg-stone-200 disabled:text-stone-400"><Send size={14} /> Post</Button>
           </div>
         </Card>
 

@@ -9,7 +9,7 @@ import FilterChips from "../components/ui/FilterChips.jsx";
 import Button, { inputClass } from "../components/ui/Button.jsx";
 import { useFund } from "../context/FundContext.jsx";
 import { MAX_DEPOSIT, MIN_DAILY, PLAN_PERIODS, QUICK_DAILY, SAVINGS_RULES, periodOf } from "../data/savingsData.js";
-import { displayPhone, normalisePhone, requestPayout, requestStkPush } from "../services/mpesa.js";
+import { displayPhone, normalisePhone, waitForPayment, waitForPlan } from "../services/mpesa.js";
 import { addMonths, daysBetween, prettyDate, today } from "../utils/dates.js";
 import { fmt } from "../utils/formatters.js";
 import { monthGrid, planStats } from "../utils/savings.js";
@@ -43,7 +43,7 @@ const whole = (v) => Number.isInteger(v);
 const heroBtn = "inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-stone-500";
 
 export default function SavingsPage() {
-  const { savings, createSavingsPlan, depositSavings, withdrawSavings } = useFund();
+  const { savings, createSavingsPlan, startSavingsDeposit, startSavingsWithdrawal, refreshSavings } = useFund();
   const now = today();
 
   const [selectedId, setSelectedId] = useState(null);
@@ -53,14 +53,22 @@ export default function SavingsPage() {
   const [phoneText, setPhoneText] = useState("");
   const [depAmount, setDepAmount] = useState("");
   const [showAll, setShowAll] = useState(false);
+  const [planError, setPlanError] = useState("");
   const abortRef = useRef(null);
   useEffect(() => () => abortRef.current?.abort(), []);
+
+  // while a payout is being sent, keep checking until M-Pesa has confirmed it
+  useEffect(() => {
+    if (!savings.some((p) => p.status === "withdrawing")) return undefined;
+    const t = setInterval(() => refreshSavings().catch(() => {}), 5000);
+    return () => clearInterval(t);
+  }, [savings, refreshSavings]);
 
   /* ---- which plan is on screen ---- */
   const plan = savings.find((p) => p.id === selectedId) ?? savings.find((p) => p.status === "active") ?? savings[0];
   const st = plan ? planStats(plan, now) : null;
   const period = plan ? periodOf(plan.periodId) : null;
-  const pace = !plan ? null : plan.status === "withdrawn" ? { label: "Withdrawn", dot: "bg-stone-400" } : PACE[st.pace];
+  const pace = !plan ? null : plan.status === "withdrawn" ? { label: "Withdrawn", dot: "bg-stone-400" } : plan.status === "withdrawing" ? { label: "Payout in progress", dot: "bg-amber-400" } : PACE[st.pace];
 
   /* ---- totals across plans ---- */
   const active = savings.filter((p) => p.status === "active").map((p) => ({ p, s: planStats(p, now) }));
@@ -77,11 +85,16 @@ export default function SavingsPage() {
   const chosen = periodOf(np.periodId);
   const spanDays = (months) => daysBetween(now, addMonths(now, months));
 
-  const startPlan = () => {
+  const startPlan = async () => {
     if (!dailyOk) return;
-    const id = createSavingsPlan({ name: np.name, dailyAmount: dailyNum, periodId: np.periodId });
-    setSelectedId(id);
-    setNewOpen(false);
+    setPlanError("");
+    try {
+      const id = await createSavingsPlan({ name: np.name, dailyAmount: dailyNum, periodId: np.periodId });
+      setSelectedId(id);
+      setNewOpen(false);
+    } catch (err) {
+      setPlanError(err.message);
+    }
   };
 
   /* ---- M-Pesa deposit / payout form ---- */
@@ -102,27 +115,37 @@ export default function SavingsPage() {
     const kind = flow.kind;
     const ctrl = new AbortController();
     abortRef.current = ctrl;
-    const onStage = (stage) => setFlow((f) => f && { ...f, stage });
+    const fail = (message, slow = false) => setFlow({ kind, stage: "error", slow, message, receipt: null });
     setFlow({ kind, stage: "sending", receipt: null });
     try {
       if (kind === "deposit") {
-        const res = await requestStkPush({ phone, amount: amt, accountRef: plan.name }, onStage, ctrl.signal);
-        depositSavings(plan.id, amt, { ref: res.receipt });
-        setFlow({ kind, stage: "confirmed", receipt: { ...res, name: plan.name } });
+        // 1) the backend asks Safaricom to pop the PIN prompt; 2) Safaricom confirms to the backend; we poll for it
+        const start = await startSavingsDeposit(plan.id, amt, phone);
+        setFlow({ kind, stage: "awaiting", receipt: null });
+        const res = await waitForPayment(start.checkout_request_id, { signal: ctrl.signal });
+        await refreshSavings();
+        if (res.status === "success") setFlow({ kind, stage: "confirmed", receipt: { receipt: res.receipt, amount: amt, name: plan.name, phone } });
+        else if (res.timedOut) fail("M-Pesa has not confirmed yet. If you entered your PIN, the deposit will appear in your plan shortly.", true);
+        else fail(res.message || "The payment was not completed. Nothing was charged.");
       } else {
-        const res = await requestPayout({ phone, amount: st.saved, reference: plan.name }, onStage, ctrl.signal);
-        withdrawSavings(plan.id);
-        setFlow({ kind, stage: "confirmed", receipt: { ...res, name: plan.name } });
+        const sent = await startSavingsWithdrawal(plan.id, phone);
+        if (sent.status === "unconfirmed") { await refreshSavings(); fail(sent.detail, true); return; }
+        setFlow({ kind, stage: "processing", receipt: null });
+        const after = await waitForPlan(plan.id, { signal: ctrl.signal });
+        await refreshSavings();
+        if (after.status === "withdrawn") setFlow({ kind, stage: "confirmed", receipt: { amount: after.withdrawn_amount, name: plan.name, phone } });
+        else if (after.status === "active") fail("The payout was not sent. Your savings are still safe in the plan.");
+        else fail("The payout is still being processed. This page will update when M-Pesa confirms it.", true);
       }
     } catch (err) {
-      setFlow(err.message === "cancelled" ? null : { kind, stage: "error", receipt: null });
+      if (err.name === "AbortError") { setFlow(null); refreshSavings().catch(() => {}); return; }
+      fail(err.message);
     }
   };
   const closeFlow = () => {
     if (!flow) return;
-    if (BUSY.includes(flow.stage)) {
-      if (flow.kind === "deposit") abortRef.current?.abort(); // a payout already on its way cannot be cancelled
-    } else setFlow(null);
+    if (flow.stage === "awaiting") abortRef.current?.abort(); // stop waiting; if the PIN is entered later the deposit still counts
+    else if (!BUSY.includes(flow.stage)) setFlow(null);       // a payout already on its way cannot be cancelled
   };
 
   const steps = flow?.kind === "withdraw" ? PAYOUT_STEPS : DEPOSIT_STEPS;
@@ -130,7 +153,8 @@ export default function SavingsPage() {
   const grid = plan ? monthGrid(plan, 5, now) : [];
   const shown = plan ? (showAll ? plan.deposits : plan.deposits.slice(0, 8)) : [];
 
-  const note = !plan ? "" : plan.status === "withdrawn" ? `You withdrew ${fmt(plan.withdrawnAmount)} on ${prettyDate(plan.withdrawnOn)}.`
+  const note = !plan ? "" : plan.status === "withdrawing" ? "Your payout is being sent to M-Pesa. This page updates by itself once it is confirmed."
+    : plan.status === "withdrawn" ? `You withdrew ${fmt(plan.withdrawnAmount)} on ${prettyDate(plan.withdrawnOn)}.`
     : st.matured ? `Your plan has matured. You can now withdraw ${fmt(st.saved)}.`
     : st.pace === "behind" ? `You are ${fmt(st.behind)} behind plan, including today. Add it any time to catch up.`
     : st.pace === "due" ? `Today's saving of ${fmt(st.behind)} is still to come.`
@@ -139,7 +163,7 @@ export default function SavingsPage() {
   return (
     <>
       <PageHeader title="Savings" subtitle="Save at least KES 50 a day and withdraw when your plan matures."
-        action={<Button onClick={() => { setNp(BLANK_PLAN); setNewOpen(true); }}><Plus size={14} /> New savings plan</Button>} />
+        action={<Button onClick={() => { setNp(BLANK_PLAN); setPlanError(""); setNewOpen(true); }}><Plus size={14} /> New savings plan</Button>} />
 
       <div className="space-y-4">
         {/* ---------- stats ---------- */}
@@ -303,8 +327,7 @@ export default function SavingsPage() {
                       </li>
                     ))}
                   </ul>
-                  <p className="mt-4 text-[11px] text-stone-400">Demo mode: no real money moves. See src/services/mpesa.js to connect the live Daraja API.</p>
-                </Card>
+                                  </Card>
               </div>
             </div>
           </>
@@ -353,6 +376,7 @@ export default function SavingsPage() {
               Save {fmt(dailyNum)} a day and you can withdraw <b className="text-stone-800">{fmt(dailyNum * spanDays(chosen.months))}</b> on <b className="text-stone-800">{prettyDate(addMonths(now, chosen.months))}</b>. Until then it stays locked.
             </p>
           )}
+          {planError && <p className="text-xs text-rose-600">{planError}</p>}
           <Button disabled={!dailyOk} onClick={startPlan} className="disabled:cursor-not-allowed disabled:bg-stone-200 disabled:text-stone-400"><PiggyBank size={14} /> Start plan</Button>
         </div>
       </Modal>
@@ -362,8 +386,10 @@ export default function SavingsPage() {
         {flow && plan && (
           flow.stage === "error" ? (
             <div className="text-center">
-              <p className="font-medium text-rose-600">{flow.kind === "withdraw" ? "The withdrawal could not be completed" : "The payment could not be completed"}</p>
-              <p className="mt-1 text-sm text-stone-500">{flow.kind === "withdraw" ? "Your savings are still safe in the plan. Please try again." : "Nothing was charged. Please try again."}</p>
+              <p className={`font-medium ${flow.slow ? "text-amber-600" : "text-rose-600"}`}>
+                {flow.slow ? "Still waiting for M-Pesa" : flow.kind === "withdraw" ? "The withdrawal could not be completed" : "The payment could not be completed"}
+              </p>
+              <p className="mt-1 text-sm text-stone-500">{flow.message || (flow.kind === "withdraw" ? "Your savings are still safe in the plan. Please try again." : "Nothing was charged. Please try again.")}</p>
               <Button className="mt-4" onClick={() => setFlow(null)}>Close</Button>
             </div>
           ) : flow.stage === null ? (
@@ -428,7 +454,7 @@ export default function SavingsPage() {
                   <Smartphone className="mx-auto text-emerald-600" size={36} />
                   <p className="mt-3 font-medium">Check your phone</p>
                   <p className="mx-auto max-w-xs text-sm text-stone-500">Enter your M-Pesa PIN to save <b>{fmt(amt)}</b> into {plan.name}.</p>
-                  <Button className="mt-4 bg-stone-100 !text-stone-700 hover:!bg-stone-200" onClick={closeFlow}>Cancel payment</Button>
+                  <Button className="mt-4 bg-stone-100 !text-stone-700 hover:!bg-stone-200" onClick={closeFlow}>Stop waiting</Button>
                 </div>
               )}
               {flow.stage === "processing" && (
@@ -443,7 +469,7 @@ export default function SavingsPage() {
                   <CheckCircle2 className="mx-auto text-emerald-600" size={40} />
                   <p className="mt-2 text-lg font-medium">{flow.kind === "withdraw" ? "Withdrawal sent" : "Saving confirmed"}</p>
                   <dl className="mt-4 space-y-2 rounded-2xl bg-stone-50 p-4 text-left text-sm">
-                    {[["Receipt", flow.receipt.receipt], ["Amount", fmt(flow.receipt.amount)], ["Plan", flow.receipt.name], [flow.kind === "withdraw" ? "To" : "From", displayPhone(flow.receipt.phone)]].map(([k, v]) => (
+                    {[["Receipt", flow.receipt.receipt], ["Amount", fmt(flow.receipt.amount)], ["Plan", flow.receipt.name], [flow.kind === "withdraw" ? "To" : "From", displayPhone(flow.receipt.phone)]].filter(([, v]) => v).map(([k, v]) => (
                       <div key={k} className="flex justify-between gap-3"><dt className="text-stone-500">{k}</dt><dd className="font-medium">{v}</dd></div>
                     ))}
                   </dl>
