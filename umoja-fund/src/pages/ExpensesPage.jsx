@@ -27,6 +27,7 @@ export default function ExpensesPage() {
   const [addOpen, setAddOpen] = useState(false);
   const [form, setForm] = useState(BLANK);
   const [selectedId, setSelectedId] = useState(null);
+  const [saveError, setSaveError] = useState("");
 
   /* ---- derived ---- */
   const missing = expenses.filter((e) => !e.postId);
@@ -54,11 +55,16 @@ export default function ExpensesPage() {
   const canSave = form.title.trim() && amount > 0 && amount <= totals.balance;
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
-  const save = () => {
+  const save = async () => {
     if (!canSave) return;
-    addExpense({ title: form.title.trim(), vendor: form.vendor.trim(), amount, category: form.category, postId: form.postId ? Number(form.postId) : null, date: today() });
-    setForm(BLANK);
-    setAddOpen(false);
+    setSaveError("");
+    try {
+      await addExpense({ title: form.title.trim(), vendor: form.vendor.trim(), amount, category: form.category, postId: form.postId ? Number(form.postId) : null });
+      setForm(BLANK);
+      setAddOpen(false);
+    } catch (err) {
+      setSaveError(err.message); // e.g. more than the available balance, decided by the server
+    }
   };
 
   const exportCsv = () => {
@@ -180,7 +186,7 @@ export default function ExpensesPage() {
             {!proofPosts.length && <option disabled>No unlinked proof posts yet</option>}
             {proofPosts.map((p) => <option key={p.id} value={p.id}>{p.text.slice(0, 50)}…</option>)}
           </select>
-          {formError && <p className="text-xs text-rose-600">{formError}</p>}
+          {(formError || saveError) && <p className="text-xs text-rose-600">{formError || saveError}</p>}
           <Button disabled={!canSave} onClick={save} className="disabled:cursor-not-allowed disabled:bg-stone-200 disabled:text-stone-400"><Plus size={14} /> Save expense</Button>
         </div>
       </Modal>
@@ -209,7 +215,7 @@ export default function ExpensesPage() {
                   <p>No proof is attached to this expense yet.</p>
                   {isAdmin && (
                     <div className="mt-3 flex flex-wrap items-center gap-2">
-                      <select defaultValue="" onChange={(e) => e.target.value && linkProof(selected.id, Number(e.target.value))} className={inputClass}>
+                      <select defaultValue="" onChange={(e) => e.target.value && linkProof(selected.id, Number(e.target.value)).catch((err) => window.alert(err.message))} className={inputClass}>
                         <option value="">Link an existing proof post…</option>
                         {proofPosts.map((p) => <option key={p.id} value={p.id}>{p.text.slice(0, 40)}…</option>)}
                       </select>

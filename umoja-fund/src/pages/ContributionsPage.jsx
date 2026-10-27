@@ -15,7 +15,7 @@ import { ProgressBar, ProgressRing } from "../components/ui/Progress.jsx";
 import { useFund } from "../context/FundContext.jsx";
 import { TARGET_PER_MEMBER as TARGET } from "../data/seedData.js";
 import { MPESA_INFO } from "../data/extraData.js";
-import { displayPhone, normalisePhone, requestStkPush } from "../services/mpesa.js";
+import { displayPhone, normalisePhone, waitForPayment } from "../services/mpesa.js";
 import { prettyDate } from "../utils/dates.js";
 import { fmt } from "../utils/formatters.js";
 
@@ -26,7 +26,7 @@ const STEPS = [
 ];
 
 export default function ContributionsPage() {
-  const { members, payments, totals, isAdmin, recordPayment } = useFund();
+  const { user, members, payments, totals, isAdmin, recordCashPayment, startMpesaPayment, refreshMoney } = useFund();
 
   /* list controls */
   const [filter, setFilter] = usePersistedState("contrib.filter", "all");
@@ -36,13 +36,14 @@ export default function ContributionsPage() {
 
   /* M-Pesa form + flow */
   const firstPending = members.find((m) => m.paid < TARGET) || members[0];
-  const [form, setForm] = useState({ memberId: firstPending?.id ?? "", phone: "", amount: "" });
+  const [form, setForm] = useState({ memberId: (isAdmin ? firstPending?.id : user.id) ?? "", phone: "", amount: "" });
   const [pay, setPay] = useState({ open: false, stage: null, receipt: null });
   const abortRef = useRef(null);
   const formRef = useRef(null);
 
   /* admin cash payment */
   const [cash, setCash] = useState(null); // { member, amount }
+  const [cashError, setCashError] = useState("");
 
   /* ---- derived ---- */
   const paidIn = (m) => m.paid >= TARGET;
@@ -67,6 +68,8 @@ export default function ContributionsPage() {
 
   /* ---- M-Pesa form state ---- */
   const member = members.find((m) => m.id === Number(form.memberId));
+  // a member can only pay for themselves; the admin can pay for anyone (the server enforces this too)
+  const payable = isAdmin ? members : members.filter((m) => m.id === user.id);
   const remaining = member ? Math.max(0, TARGET - member.paid) : 0;
   const phone = normalisePhone(form.phone);
   const amount = Number(form.amount);
@@ -75,7 +78,7 @@ export default function ContributionsPage() {
   const canPay = member && remaining > 0 && phone && amount >= 10 && amount <= remaining;
 
   const choose = (m) => {
-    setForm({ memberId: m.id, phone: m.phone, amount: String(Math.max(0, TARGET - m.paid)) });
+    setForm({ memberId: m.id, phone: m.phone || "", amount: String(Math.max(0, TARGET - m.paid)) });
     formRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   };
 
@@ -84,24 +87,40 @@ export default function ContributionsPage() {
     abortRef.current = ctrl;
     setPay({ open: true, stage: "sending", receipt: null });
     try {
-      const res = await requestStkPush({ phone, amount, accountRef: member.name }, (stage) => setPay((p) => ({ ...p, stage })), ctrl.signal);
-      recordPayment(member.id, amount, { method: "M-Pesa", ref: res.receipt });
-      setPay({ open: true, stage: "confirmed", receipt: { ...res, name: member.name } });
-      setForm((f) => ({ ...f, amount: "" }));
+      // 1) the backend asks Safaricom to pop the PIN prompt on the phone
+      const start = await startMpesaPayment({ memberId: member.id, amount, phone });
+      setPay({ open: true, stage: "awaiting", receipt: null });
+      // 2) Safaricom confirms to the backend; we poll until it has the answer
+      const res = await waitForPayment(start.checkout_request_id, { signal: ctrl.signal });
+      await refreshMoney();
+      if (res.status === "success") {
+        setPay({ open: true, stage: "confirmed", receipt: { receipt: res.receipt, amount, name: member.name, phone } });
+        setForm((f) => ({ ...f, amount: "" }));
+      } else if (res.timedOut) {
+        setPay({ open: true, stage: "error", slow: true, receipt: null,
+          message: "M-Pesa has not confirmed yet. If you entered your PIN, the payment will appear in the history shortly." });
+      } else {
+        setPay({ open: true, stage: "error", receipt: null, message: res.message || "The payment was not completed. Nothing was charged." });
+      }
     } catch (err) {
-      setPay(err.message === "cancelled" ? { open: false, stage: null, receipt: null } : { open: true, stage: "error", receipt: null });
+      if (err.name === "AbortError") { setPay({ open: false, stage: null, receipt: null }); refreshMoney().catch(() => {}); return; }
+      setPay({ open: true, stage: "error", receipt: null, message: err.message });
     }
   };
   const closePay = () => {
-    if (pay.stage === "sending" || pay.stage === "awaiting") abortRef.current?.abort();
-    else setPay({ open: false, stage: null, receipt: null });
+    if (pay.stage === "awaiting") abortRef.current?.abort(); // stop waiting; if the PIN is entered later the payment still counts
+    else if (pay.stage !== "sending") setPay({ open: false, stage: null, receipt: null });
   };
 
-  const saveCash = () => {
+  const saveCash = async () => {
     const v = Number(cash.amount);
-    if (v > 0 && v <= TARGET - cash.member.paid) {
-      recordPayment(cash.member.id, v, { method: "Cash" });
+    if (!(v > 0 && v <= TARGET - cash.member.paid)) return;
+    setCashError("");
+    try {
+      await recordCashPayment(cash.member.id, v);
       setCash(null);
+    } catch (err) {
+      setCashError(err.message);
     }
   };
 
@@ -150,13 +169,13 @@ export default function ContributionsPage() {
                     </div>
                   </div>
                   <StatusBadge paid={m.paid} />
-                  {!paidIn(m) && (
+                  {!paidIn(m) && (isAdmin || m.id === user.id) && (
                     <div className="flex gap-1.5">
                       <button onClick={() => choose(m)} className="inline-flex items-center gap-1 rounded-full bg-emerald-600 px-3 py-1.5 text-xs text-white hover:bg-emerald-700">
                         <Smartphone size={12} /> Pay
                       </button>
                       {isAdmin && (
-                        <button onClick={() => setCash({ member: m, amount: String(TARGET - m.paid) })} className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-3 py-1.5 text-xs text-stone-700 hover:bg-stone-200">
+                        <button onClick={() => { setCashError(""); setCash({ member: m, amount: String(TARGET - m.paid) }); }} className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-3 py-1.5 text-xs text-stone-700 hover:bg-stone-200">
                           <Banknote size={12} /> Cash
                         </button>
                       )}
@@ -177,7 +196,7 @@ export default function ContributionsPage() {
               <div className="space-y-3">
                 <label className="block text-xs text-stone-500">Paying for
                   <select value={form.memberId} onChange={(e) => setForm({ ...form, memberId: e.target.value, amount: "" })} className={`${inputClass} mt-1 w-full`}>
-                    {members.map((m) => <option key={m.id} value={m.id}>{m.name} · {paidIn(m) ? "paid in full" : `${fmt(TARGET - m.paid)} left`}</option>)}
+                    {payable.map((m) => <option key={m.id} value={m.id}>{m.name} · {paidIn(m) ? "paid in full" : `${fmt(TARGET - m.paid)} left`}</option>)}
                   </select>
                 </label>
 
@@ -218,8 +237,7 @@ export default function ContributionsPage() {
                 <p className="mt-1">Paybill <b className="text-stone-800">{MPESA_INFO.paybill}</b> · Account <b className="text-stone-800">{MPESA_INFO.account}</b></p>
                 <p className="mt-1">Then tell the admin so the payment can be recorded.</p>
               </div>
-              <p className="mt-3 text-[11px] text-stone-400">Demo mode: no real money moves. See src/services/mpesa.js to connect the live Daraja API.</p>
-            </Card>
+                          </Card>
 
             <Card className="flex items-center gap-5">
               <ProgressRing value={pct} size={100} />
@@ -270,8 +288,8 @@ export default function ContributionsPage() {
       <Modal open={pay.open} onClose={closePay} title="M-Pesa payment">
         {pay.stage === "error" ? (
           <div className="text-center">
-            <p className="font-medium text-rose-600">The payment could not be completed</p>
-            <p className="mt-1 text-sm text-stone-500">Nothing was charged. Please try again.</p>
+            <p className={`font-medium ${pay.slow ? "text-amber-600" : "text-rose-600"}`}>{pay.slow ? "Still waiting for M-Pesa" : "The payment could not be completed"}</p>
+            <p className="mt-1 text-sm text-stone-500">{pay.message || "Nothing was charged. Please try again."}</p>
             <Button className="mt-4" onClick={closePay}>Close</Button>
           </div>
         ) : (
@@ -297,7 +315,7 @@ export default function ContributionsPage() {
                 <Smartphone className="mx-auto text-emerald-600" size={36} />
                 <p className="mt-3 font-medium">Check your phone</p>
                 <p className="mx-auto max-w-xs text-sm text-stone-500">Enter your M-Pesa PIN to pay <b>{fmt(amount)}</b> to {MPESA_INFO.name}.</p>
-                <Button className="mt-4 bg-stone-100 !text-stone-700 hover:!bg-stone-200" onClick={closePay}>Cancel payment</Button>
+                <Button className="mt-4 bg-stone-100 !text-stone-700 hover:!bg-stone-200" onClick={closePay}>Stop waiting</Button>
               </div>
             )}
             {pay.stage === "confirmed" && pay.receipt && (
@@ -305,7 +323,7 @@ export default function ContributionsPage() {
                 <CheckCircle2 className="mx-auto text-emerald-600" size={40} />
                 <p className="mt-2 text-lg font-medium">Payment confirmed</p>
                 <dl className="mt-4 space-y-2 rounded-2xl bg-stone-50 p-4 text-left text-sm">
-                  {[["Receipt", pay.receipt.receipt], ["Amount", fmt(pay.receipt.amount)], ["For", pay.receipt.name], ["From", displayPhone(pay.receipt.phone)]].map(([k, v]) => (
+                  {[["Receipt", pay.receipt.receipt], ["Amount", fmt(pay.receipt.amount)], ["For", pay.receipt.name], ["From", displayPhone(pay.receipt.phone)]].filter(([, v]) => v).map(([k, v]) => (
                     <div key={k} className="flex justify-between gap-3"><dt className="text-stone-500">{k}</dt><dd className="font-medium">{v}</dd></div>
                   ))}
                 </dl>
@@ -323,6 +341,7 @@ export default function ContributionsPage() {
             <p className="text-sm text-stone-600">{cash.member.name} still owes <b>{fmt(TARGET - cash.member.paid)}</b>.</p>
             <input type="number" min="1" max={TARGET - cash.member.paid} value={cash.amount} onChange={(e) => setCash({ ...cash, amount: e.target.value })} className={`${inputClass} w-full`} />
             {Number(cash.amount) > TARGET - cash.member.paid && <p className="text-xs text-rose-600">That is more than the balance owed.</p>}
+            {cashError && <p className="text-xs text-rose-600">{cashError}</p>}
             <Button onClick={saveCash}><Banknote size={14} /> Record payment</Button>
           </div>
         )}
