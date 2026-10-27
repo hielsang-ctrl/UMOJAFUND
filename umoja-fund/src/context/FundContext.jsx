@@ -1,104 +1,150 @@
-import { createContext, useContext, useMemo, useState } from "react";
-import usePersistedState from "../hooks/usePersistedState.js";
-import { seedMembers, seedExpenses, seedPosts, TARGET_PER_MEMBER } from "../data/seedData.js";
-import { seedPayments } from "../data/extraData.js";
-import { MAX_DEPOSIT, MIN_DAILY, periodOf, seedSavings } from "../data/savingsData.js";
-import { addMonths, today } from "../utils/dates.js";
-import { planStats } from "../utils/savings.js";
+import { createContext, useCallback, useContext, useEffect, useState } from "react";
+import { Loader2 } from "lucide-react";
+import { api } from "../services/api.js";
+import { toExpense, toMessage, toPayment, toPlan } from "../services/adapters.js";
+import { AuthContext } from "./AuthContext.jsx";
 
 const FundContext = createContext(null);
 
+const EMPTY_TOTALS = { collected: 0, spent: 0, expected: 0, balance: 0, percent: 0 };
+
+// what to fetch for each piece of data, and how to reshape it for the pages
+const SOURCES = {
+  members: ["/members/", (x) => x],
+  summary: ["/fund/summary/", (x) => x],
+  payments: ["/payments/", (l) => l.map(toPayment).filter((p) => p.status === "completed")],
+  expenses: ["/expenses/", (l) => l.map(toExpense)],
+  posts: ["/posts/", (x) => x],
+  messages: ["/messages/", (l) => l.map(toMessage)],
+  savings: ["/savings/plans/", (l) => l.map(toPlan)],
+};
+const ALL = Object.keys(SOURCES);
+
 /**
- * Single source of truth. Each action maps to one backend endpoint:
- *   recordPayment -> POST /payments        (M-Pesa rows are written by the Daraja callback)
- *   addExpense    -> POST /expenses
- *   linkProof     -> PATCH /expenses/:id
- *   addPost       -> POST /posts
- *   toggleLike    -> POST /posts/:id/like
- *   addComment    -> POST /posts/:id/comments
- *   sendMessage   -> POST /messages
- *   createSavingsPlan  -> POST /savings/plans
- *   depositSavings     -> POST /savings/plans/:id/deposits   (M-Pesa rows written by the Daraja callback)
- *   withdrawSavings    -> POST /savings/plans/:id/withdraw   (server re-checks the maturity date, then pays out via B2C)
+ * Single source of truth, now backed by the Django API. The pages use the same names as before
+ * (members, expenses, posts, payments, savings, totals, isAdmin...). Actions are async: they call the
+ * backend, then refresh whatever changed. Money is only ever counted once the SERVER says so.
  */
 export function FundProvider({ children }) {
-  const [role, setRole] = usePersistedState("role", "admin"); // "admin" | "member" (remembered only with Preferences cookies)
-  const [members, setMembers] = useState(seedMembers);
-  const [expenses, setExpenses] = useState(seedExpenses);
-  const [posts, setPosts] = useState(() => seedPosts.map((p) => ({ likes: 0, liked: false, comments: [], ...p })));
-  const [payments, setPayments] = useState(seedPayments);
-  const [messages, setMessages] = useState([]);
-  const [savings, setSavings] = useState(seedSavings); // the signed-in person's own plans
+  const auth = useContext(AuthContext); // null if an old provider sits outside <AuthProvider>: then it stays idle
+  const user = auth?.user ?? null;
 
-  const totals = useMemo(() => {
-    const collected = members.reduce((s, m) => s + m.paid, 0);
-    const spent = expenses.reduce((s, e) => s + e.amount, 0);
-    const expected = members.length * TARGET_PER_MEMBER;
-    // percent is 0 (not NaN) when the group has no members yet
-    return { collected, spent, expected, balance: collected - spent, percent: expected ? (collected / expected) * 100 : 0 };
-  }, [members, expenses]);
+  const [data, setData] = useState({ members: [], summary: EMPTY_TOTALS, payments: [], expenses: [], posts: [], messages: [], savings: [] });
+  const [ready, setReady] = useState(false);
+  const [loadError, setLoadError] = useState("");
+
+  const refresh = useCallback(async (...names) => {
+    await Promise.all(
+      names.map(async (name) => {
+        const [path, map] = SOURCES[name];
+        const result = map(await api(path));
+        setData((d) => ({ ...d, [name]: result }));
+      })
+    );
+  }, []);
+
+  const loadAll = useCallback(async () => {
+    setLoadError("");
+    try { await refresh(...ALL); setReady(true); } catch (err) { setLoadError(err.message); }
+  }, [refresh]);
+
+  const userId = user?.id;
+  useEffect(() => {
+    if (!userId) { setReady(false); return; }
+    setReady(false);
+    loadAll();
+  }, [userId, loadAll]);
+
+  if (user && !ready) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-stone-100 p-4">
+        {loadError ? (
+          <div className="max-w-sm rounded-3xl bg-white p-6 text-center shadow-sm">
+            <p className="font-medium text-rose-600">Could not load the fund</p>
+            <p className="mt-1 text-sm text-stone-500">{loadError}</p>
+            <button onClick={loadAll} className="mt-4 rounded-full bg-stone-900 px-5 py-2.5 text-sm text-white hover:bg-black">Try again</button>
+          </div>
+        ) : (
+          <Loader2 className="animate-spin text-stone-400" size={32} />
+        )}
+      </div>
+    );
+  }
+
+  const money = () => refresh("members", "summary", "payments");
+  const setPosts = (fn) => setData((d) => ({ ...d, posts: fn(d.posts) }));
 
   const value = {
-    role, setRole, isAdmin: role === "admin",
-    members, expenses, posts, payments, messages, savings, totals,
+    user,
+    role: user?.access,
+    isAdmin: user?.access === "admin",
+    members: data.members, expenses: data.expenses, posts: data.posts, payments: data.payments,
+    messages: data.messages, savings: data.savings,
+    totals: data.summary,
+    reload: loadAll,
 
-    recordPayment: (id, amount, { method = "Cash", ref } = {}) => {
-      const member = members.find((m) => m.id === id);
-      setMembers((ms) => ms.map((m) => (m.id === id ? { ...m, paid: m.paid + amount } : m)));
-      setPayments((ps) => [
-        { id: Date.now(), memberId: id, name: member?.name ?? "Member", amount, method,
-          ref: ref || "CASH-" + String(Date.now()).slice(-6), date: today() },
-        ...ps,
-      ]);
+    /* ---------- contributions ---------- */
+    recordCashPayment: async (memberId, amount, reference) => {
+      await api("/payments/", { method: "POST", body: { member: memberId, amount, ...(reference ? { reference } : {}) } });
+      await money();
+    },
+    // returns { payment_id, checkout_request_id }; then call waitForPayment() from services/mpesa.js
+    startMpesaPayment: ({ memberId, amount, phone }) =>
+      api("/payments/mpesa/", { method: "POST", body: { member: memberId, amount, phone } }),
+    refreshMoney: money,
+
+    /* ---------- expenses ---------- */
+    addExpense: async ({ title, vendor, amount, category, postId }) => {
+      await api("/expenses/", { method: "POST", body: { title, vendor, amount, category, post: postId ?? null } });
+      await refresh("expenses", "summary");
+    },
+    linkProof: async (expenseId, postId) => {
+      await api(`/expenses/${expenseId}/proof/`, { method: "PATCH", body: { post: postId } });
+      await refresh("expenses");
     },
 
-    addExpense: (e) => setExpenses((x) => [{ ...e, id: Date.now() }, ...x]),
-    // one proof post can back only one expense
-    linkProof: (expenseId, postId) =>
-      setExpenses((xs) =>
-        xs.some((e) => e.postId === postId && e.id !== expenseId)
-          ? xs
-          : xs.map((e) => (e.id === expenseId ? { ...e, postId } : e))
-      ),
-
-    // returns the new post id so a proof post can be linked to an expense straight away
-    addPost: (p) => {
-      const id = Date.now();
-      setPosts((x) => [{ likes: 0, liked: false, comments: [], ...p, id }, ...x]);
-      return id;
+    /* ---------- ideas & proof ---------- */
+    // `file` is an image Blob/File (or null). Returns the new post id so it can be linked to an expense.
+    addPost: async ({ kind, text, file }) => {
+      const form = new FormData();
+      form.append("kind", kind);
+      form.append("text", text);
+      if (file) form.append("image", file, "photo.jpg");
+      const post = await api("/posts/", { method: "POST", body: form });
+      setPosts((ps) => [post, ...ps]);
+      return post.id;
     },
-    toggleLike: (id) =>
-      setPosts((ps) => ps.map((p) => (p.id === id ? { ...p, liked: !p.liked, likes: p.likes + (p.liked ? -1 : 1) } : p))),
-    addComment: (id, text, author) =>
-      setPosts((ps) => ps.map((p) => (p.id === id ? { ...p, comments: [...p.comments, { id: Date.now(), author, text }] } : p))),
+    toggleLike: async (id) => {
+      setPosts((ps) => ps.map((p) => (p.id === id ? { ...p, liked: !p.liked, likes: p.likes + (p.liked ? -1 : 1) } : p)));
+      try {
+        const r = await api(`/posts/${id}/like/`, { method: "POST" });
+        setPosts((ps) => ps.map((p) => (p.id === id ? { ...p, liked: r.liked, likes: r.likes } : p)));
+      } catch {
+        refresh("posts").catch(() => {}); // undo the optimistic change
+      }
+    },
+    addComment: async (id, text) => {
+      const comment = await api(`/posts/${id}/comments/`, { method: "POST", body: { text } });
+      setPosts((ps) => ps.map((p) => (p.id === id ? { ...p, comments: [...p.comments, comment] } : p)));
+    },
 
-    sendMessage: (msg) => setMessages((m) => [{ id: Date.now(), date: today(), ...msg }, ...m]),
+    /* ---------- messages ---------- */
+    sendMessage: async ({ audience, recipient, body }) => {
+      await api("/messages/", { method: "POST", body: { audience, ...(recipient ? { recipient } : {}), body } });
+      await refresh("messages");
+    },
 
     /* ---------- personal savings ---------- */
-    // starts today and locks until today + the chosen period; returns the new plan id
-    createSavingsPlan: ({ name, dailyAmount, periodId }) => {
-      const period = periodOf(periodId);
-      const startDate = today();
-      const id = Date.now();
-      setSavings((ps) => [{
-        id, name: name?.trim() || "My savings", dailyAmount: Math.max(MIN_DAILY, Math.round(dailyAmount)),
-        periodId: period.id, months: period.months, startDate, maturityDate: addMonths(startDate, period.months),
-        deposits: [], status: "active", withdrawnOn: null, withdrawnAmount: 0,
-      }, ...ps]);
-      return id;
+    createSavingsPlan: async ({ name, dailyAmount, periodId }) => {
+      const plan = await api("/savings/plans/", { method: "POST", body: { name, daily_amount: dailyAmount, period: periodId } });
+      setData((d) => ({ ...d, savings: [toPlan(plan), ...d.savings] }));
+      return plan.id;
     },
-    depositSavings: (planId, amount, { ref } = {}) =>
-      setSavings((ps) => ps.map((p) => {
-        if (p.id !== planId || !planStats(p).canDeposit) return p;
-        if (!(amount >= MIN_DAILY && amount <= MAX_DEPOSIT)) return p;
-        return { ...p, deposits: [{ id: Date.now(), date: today(), amount, ref: ref || "SV" + String(Date.now()).slice(-6) }, ...p.deposits] };
-      })),
-    // only pays out once the maturity date has been reached
-    withdrawSavings: (planId) =>
-      setSavings((ps) => ps.map((p) => {
-        const st = planStats(p);
-        return p.id === planId && st.canWithdraw ? { ...p, status: "withdrawn", withdrawnOn: today(), withdrawnAmount: st.saved } : p;
-      })),
+    startSavingsDeposit: (planId, amount, phone) =>
+      api(`/savings/plans/${planId}/deposit/`, { method: "POST", body: { amount, phone } }),
+    startSavingsWithdrawal: (planId, phone) =>
+      api(`/savings/plans/${planId}/withdraw/`, { method: "POST", body: { phone } }),
+    refreshSavings: () => refresh("savings"),
   };
 
   return <FundContext.Provider value={value}>{children}</FundContext.Provider>;
